@@ -18,7 +18,7 @@ git clone https://github.com/uroosaimtiaz/dns-client.git
 
 2. Navigate to the repository directory:
 
-cd dns-client/client
+cd dns-client
 
 3. Run the DNS client with the domain you want to query as an argument:
 
