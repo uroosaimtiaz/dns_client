@@ -9,8 +9,9 @@ class DNSResponse:
         self.domain = ""
         self.offset = 0
         self.ancount = 0
-        self.authority_records = 0
-        self.additional_records = 0
+        self.nscount = 0
+        self.arcount = 0
+        self.domain_length = 0
 
     def parse_and_print_header(self):
         """
@@ -62,11 +63,12 @@ class DNSResponse:
         print(";; flags: qr rd ra; QUERY: {}, ANSWER: {}, AUTHORITY: {}, ADDITIONAL: {}".format(qdcount, ancount, nscount, arcount))
         print("Number of authority records: {}".format(nscount))
         self.ancount = ancount
-        self.authority_records = nscount
+        self.nscount = nscount
+        self.arcount = arcount
         self.offset = 12  # Skip header
 
 
-    def parse_and_print_dns_question(self, offset, qtype=1, qclass=1):
+    def parse_and_print_dns_question(self, qtype=1, qclass=1):
         """
         Parses the question section of a DNS response and prints the domain name.
         Based on the output of the dig command, the question section should look like this:
@@ -88,16 +90,17 @@ class DNSResponse:
         qtype_names = [None, "A", "NS", "CNAME", "SOA", "PTR", "MX", "TXT", "AAAA"]
         qclass_names = [None, "IN", "CS", "CH", "HS"]
         domain = ""
-        while self.response[offset] != 0:
-            label_length = self.response[offset]
-            label = self.response[offset + 1 : offset + 1 + label_length].decode("utf-8")
+        while self.response[self.offset] != 0:
+            label_length = self.response[self.offset]
+            label = self.response[self.offset + 1 : self.offset + 1 + label_length].decode("utf-8")
             domain += label + "."
-            offset += label_length + 1 # Skip the length byte
+            self.offset += label_length + 1 # Skip the length byte
         self.domain = domain
-        print(f";{domain}                  {qclass_names[qclass]}      {qtype_names[qtype]}\n")
-        return offset + 5  # Skip null byte and QTYPE/QCLASS
+        print(f";{domain}                   {qclass_names[qclass]}      {qtype_names[qtype]}\n")
+        self.domain_length = self.offset - 12 + 1 # subtract 12 for the header and add 1 to include the null byte
+        self.offset += 5  # Skip null byte and QTYPE/QCLASS
     
-    def parse_and_print_dns_answer(self, offset, ancount=1, qtype=1, qclass=1):
+    def parse_and_print_dns_answer(self):
         """
         Parses the answer section of a DNS response and prints the values of the fields.
         Based on the output of the dig command, the answer section should look like this:
@@ -121,22 +124,61 @@ class DNSResponse:
         +--------+--------+--------+-------+--------+------+
         """
         print(";; ANSWER SECTION:")
-        qtype_names = [None, "A", "NS", "CNAME", "SOA", "PTR", "MX", "TXT", "AAAA"]
-        qclass_names = [None, "IN", "CS", "CH", "HS"]
         for _ in range(self.ancount): # Loop through the number of answers, which is 1 by default for our client
-            offset += 2 # Skipping compressed domain name pointer
-            type, class_, ttl, rdlength = struct.unpack('>HHIH', self.response[offset:offset + 10])
-            offset += 10
+            if self.response[self.offset] >= 0xC0:  # The domain name is compressed
+                self.offset += 2  # Skip the pointer
+            else:  # The domain name is not compressed
+                self.offset += self.domain_length # Skip the domain name
+
+            type, class_, ttl, rdlength = struct.unpack('>HHIH', self.response[self.offset:self.offset + 10])
+            self.offset += 10
+            
             if type == 1:  # A record
                 '''
                 The RDLLENGTH field specifies the length of the RDATA field, which is 4 bytes for an A record.
                 The RDATA field contains the IP address of the domain name.
                 '''
-                ip_address = socket.inet_ntoa(self.response[offset:offset + rdlength])
+                ip_address = socket.inet_ntoa(self.response[self.offset:self.offset + rdlength])
                 print(f"{self.domain}             {ttl}     IN      A       {ip_address}")
-            offset += rdlength
+                self.offset += rdlength
+            elif type == 2:  # NS record
+                nameserver, self.offset = self.read_name(self.response, self.offset)
+                print(f"{self.domain}             {ttl}     IN      NS      {nameserver}")
+            elif type == 5:  # CNAME record
+                canonical_name, self.offset = self.read_name(self.response, self.offset)
+                print(f"{self.domain}             {ttl}     IN      CNAME   {canonical_name}")
+            elif type == 28:  # AAAA record
+                ipv6_address = socket.inet_ntop(socket.AF_INET6, self.response[self.offset:self.offset + rdlength])
+                print(f"{self.domain}             {ttl}     IN      AAAA    {ipv6_address}")
+                self.read_name(self.response, self.offset)
 
-    def parse_and_print_authority_records(self, offset, nscount=0):
+    def read_name(self, response, offset):
+        '''
+        Converts a sequence of labels into a domain name, used for parsing the domain name in the answer sections.
+        '''
+        labels = [] # Initialize an empty list to store the labels
+
+        while True:
+            length = response[offset]
+
+            # Check for a pointer
+            if length >= 0xc0:
+                pointer = struct.unpack_from('!H', response, offset)[0] # Unpack the pointer
+                pointer &= 0x3fff  # Remove the first two bits
+                label, _ = self.read_name(response, pointer)  # Ignore the returned offset
+                offset += 2  # Skip the pointer
+                break
+            elif length == 0:
+                offset += 1  # Skip the null byte
+                break
+            else:
+                label = response[offset + 1 : offset + 1 + length].decode("utf-8")
+                labels.append(label)
+                offset += 1 + length  # Skip the length byte and the label
+
+        return ".".join(labels), offset
+
+    def parse_and_print_authority_records(self):
         """
         Parses the authority section of a DNS response and prints the values of the fields.
         Based on the output of the dig command, the authority section should look like this:
@@ -160,36 +202,35 @@ class DNSResponse:
         +--------+--------+--------+-------+--------+------+
         """
         print("\n;; AUTHORITY SECTION:")
-        qtype_names = [None, "A", "NS", "CNAME", "SOA", "PTR", "MX", "TXT", "AAAA"]
-        qclass_names = [None, "IN", "CS", "CH", "HS"]
-        for _ in range(nscount): # Loop through the number of authority records
-            offset += 2 # Skipping compressed domain name pointer
-            type, class_, ttl, rdlength = struct.unpack('>HHIH', self.response[offset:offset + 10])
-            offset += 10
+        for _ in range(self.nscount): # Loop through the number of answers, which is 1 by default for our client
+            if self.response[self.offset] >= 0xC0:  # The domain name is compressed
+                self.offset += 2  # Skip the pointer
+            else:  # The domain name is not compressed
+                self.offset += self.domain_length # Skip the domain name
+
+            type, class_, ttl, rdlength = struct.unpack('>HHIH', self.response[self.offset:self.offset + 10])
+            self.offset += 10
+
             if type == 1:  # A record
-                ip_address = socket.inet_ntoa(self.response[offset:offset + rdlength])
+                '''
+                The RDLLENGTH field specifies the length of the RDATA field, which is 4 bytes for an A record.
+                The RDATA field contains the IP address of the domain name.
+                '''
+                ip_address = socket.inet_ntoa(self.response[self.offset:self.offset + rdlength])
                 print(f"{self.domain}             {ttl}     IN      A       {ip_address}")
+                self.offset += rdlength
             elif type == 2:  # NS record
-                nameserver = self.response[offset:offset + rdlength].decode("utf-8")
+                nameserver, self.offset = self.read_name(self.response, self.offset)
                 print(f"{self.domain}             {ttl}     IN      NS      {nameserver}")
             elif type == 5:  # CNAME record
-                canonical_name = self.response[offset:offset + rdlength].decode("utf-8")
+                canonical_name, self.offset = self.read_name(self.response, self.offset)
                 print(f"{self.domain}             {ttl}     IN      CNAME   {canonical_name}")
-            elif type == 15:  # MX record
-                preference, = struct.unpack('>H', self.response[offset:offset + 2])
-                exchange = self.response[offset + 2:offset + rdlength].decode("utf-8")
-                print(f"{self.domain}             {ttl}     IN      MX      {preference} {exchange}")
-            elif type == 16:  # TXT record
-                txt_data = self.response[offset + 1:offset + rdlength].decode("utf-8")  # Skip the length byte
-                print(f"{self.domain}             {ttl}     IN      TXT     {txt_data}")
             elif type == 28:  # AAAA record
-                ipv6_address = socket.inet_ntop(socket.AF_INET6, self.response[offset:offset + rdlength])
+                ipv6_address = socket.inet_ntop(socket.AF_INET6, self.response[self.offset:self.offset + rdlength])
                 print(f"{self.domain}             {ttl}     IN      AAAA    {ipv6_address}")
-            offset += rdlength
-        return offset
+                self.read_name(self.response, self.offset)
 
-
-    def parse_and_print_additional_records(self, offset, arcount=0):
+    def parse_and_print_additional_records(self):
         """
         Parses the additional records section of a DNS response and prints the values of the fields.
         Based on the output of the dig command, the additional records section should look like this:
@@ -198,9 +239,35 @@ class DNSResponse:
             ...
         """
         print("\n;; ADDITIONAL SECTION:")
-        pass
+        for _ in range(self.arcount): # Loop through the number of answers, which is 1 by default for our client
+            if self.response[self.offset] >= 0xC0:  # The domain name is compressed
+                self.offset += 2  # Skip the pointer
+            else:  # The domain name is not compressed
+                self.offset += self.domain_length # Skip the domain name
 
-    def parse_and_print_dns_response(self, start_time, server_ip='8.8.8.8'):
+            type, class_, ttl, rdlength = struct.unpack('>HHIH', self.response[self.offset:self.offset + 10])
+            self.offset += 10
+            
+            if type == 1:  # A record
+                '''
+                The RDLLENGTH field specifies the length of the RDATA field, which is 4 bytes for an A record.
+                The RDATA field contains the IP address of the domain name.
+                '''
+                ip_address = socket.inet_ntoa(self.response[self.offset:self.offset + rdlength])
+                print(f"{self.domain}             {ttl}     IN      A       {ip_address}")
+                self.offset += rdlength
+            elif type == 2:  # NS record
+                nameserver, self.offset = self.read_name(self.response, self.offset)
+                print(f"{self.domain}             {ttl}     IN      NS      {nameserver}")
+            elif type == 5:  # CNAME record
+                canonical_name, self.offset = self.read_name(self.response, self.offset)
+                print(f"{self.domain}             {ttl}     IN      CNAME   {canonical_name}")
+            elif type == 28:  # AAAA record
+                ipv6_address = socket.inet_ntop(socket.AF_INET6, self.response[self.offset:self.offset + rdlength])
+                print(f"{self.domain}             {ttl}     IN      AAAA    {ipv6_address}")
+                self.read_name(self.response, self.offset)
+
+    def parse_and_print_dns_response(self, query_time, server_ip='192.168.2.1'):
         """
         Parses the DNS response and prints the values of the fields.
 
@@ -211,17 +278,16 @@ class DNSResponse:
         ;; WHEN: Fri Feb 23 20:04:52 EST 2024
         ;; MSG SIZE  rcvd: 46
         """
+        # print("Full response (hexadecimal):\n", self.response.hex())
         self.parse_and_print_header()
-        self.offset = self.parse_and_print_dns_question(12)
-        self.parse_and_print_dns_answer(self.offset)
-        if self.authority_records > 0:
-            print("\n;; AUTHORITY SECTION: ")
-            self.parse_and_print_authority_records(self.offset)
-        if self.additional_records > 0:
-            self.parse_and_print_additional_records(self.offset)
+        self.parse_and_print_dns_question()
+        self.parse_and_print_dns_answer()
+        if self.nscount > 0:
+            self.parse_and_print_authority_records()
+        if self.arcount > 0:
+            self.parse_and_print_additional_records()
 
-        query_time = int((time.time() - start_time) * 1000)  # Calculate the query time in milliseconds
-        print("\n;; Query time: {} msec".format(query_time))
+        print("\n;; Query time: {:.2f} msec".format(query_time * 1000))
         print(";; SERVER: {}#53({})".format(server_ip, server_ip))
         print(";; WHEN: {}".format(time.strftime("%a %b %d %H:%M:%S %Z %Y")))
         print(";; MSG SIZE rcvd: {}".format(len(self.response)))
